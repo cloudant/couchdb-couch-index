@@ -60,24 +60,6 @@ validate(DbName, DDoc) ->
     lists:foreach(ValidateFun, EnabledIndexers).
 
 
-get_index(Module, #db{name = <<"shards/", _/binary>> = DbName}, DDoc) ->
-    case is_record(DDoc, doc) of
-        true -> get_index(Module, DbName, DDoc, nil);
-        false -> get_index(Module, DbName, DDoc)
-    end;
-get_index(Module, <<"shards/", _/binary>> = DbName, DDoc) ->
-    {Pid, Ref} = spawn_monitor(fun() ->
-        exit(fabric:open_doc(mem3:dbname(DbName), DDoc, [ejson_body, ?ADMIN_CTX]))
-    end),
-    receive {'DOWN', Ref, process, Pid, {ok, Doc}} ->
-        get_index(Module, DbName, Doc, nil);
-    {'DOWN', Ref, process, Pid, Error} ->
-        Error
-    after 61000 ->
-        erlang:demonitor(Ref, [flush]),
-        {error, timeout}
-    end;
-
 get_index(Module, DbName, DDoc) ->
     get_index(Module, DbName, DDoc, nil).
 
@@ -86,10 +68,12 @@ get_index(Module, DbName, DDoc, Fun) when is_binary(DbName) ->
     couch_util:with_db(DbName, fun(Db) ->
         get_index(Module, Db, DDoc, Fun)
     end);
-get_index(Module, Db, DDoc, Fun) when is_binary(DDoc) ->
-    case couch_db:open_doc(Db, DDoc, [ejson_body, ?ADMIN_CTX]) of
-        {ok, Doc} -> get_index(Module, Db, Doc, Fun);
-        Error -> Error
+get_index(Module, Db, DDocId, Fun) when is_binary(DDocId) ->
+    case open_ddoc(Db, DDocId) of
+        {ok, DDoc} ->
+            get_index(Module, Db, DDoc, Fun);
+        Error ->
+            Error
     end;
 get_index(Module, Db, DDoc, Fun) when is_function(Fun, 1) ->
     {ok, InitState} = Module:init(Db, DDoc),
@@ -262,3 +246,27 @@ handle_db_event(DbName, {ddoc_updated, DDocId}, St) ->
     {ok, St};
 handle_db_event(_DbName, _Event, St) ->
     {ok, St}.
+
+
+
+open_ddoc(Db, DDocId) ->
+    case couch_db:name(Db) of
+        <<"shards/", _/binary>> = DbName ->
+            open_cluster_ddoc(DbName, DDocId);
+        _ ->
+            couch_db:open_doc(Db, DDocId, [ejson_body, ?ADMIN_CTX])
+    end.
+
+
+open_cluster_ddoc(<<"shards/", _/binary>> = DbName, DDocId) ->
+    {Pid, Ref} = spawn_monitor(fun() ->
+        exit(fabric:open_doc(mem3:dbname(DbName), DDocId, [ejson_body, ?ADMIN_CTX]))
+    end),
+    receive {'DOWN', Ref, process, Pid, {ok, Doc}} ->
+        {ok, Doc};
+    {'DOWN', Ref, process, Pid, Error} ->
+        Error
+    after 61000 ->
+        erlang:demonitor(Ref, [flush]),
+        {error, timeout}
+    end.
