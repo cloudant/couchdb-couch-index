@@ -16,7 +16,7 @@
 
 -vsn(2).
 
--export([start_link/0, validate/2, get_index/4, get_index/3, get_index/2]).
+-export([start_link/0, validate/2, get_index/4, get_index/3, get_index_from_state/3]).
 
 -export([init/1, terminate/2, code_change/3]).
 -export([handle_call/3, handle_cast/2, handle_info/2]).
@@ -28,14 +28,19 @@
     handle_db_event/3
 ]).
 
+-include("couch_index.hrl").
+
 -include_lib("couch/include/couch_db.hrl").
 
--define(BY_SIG, couchdb_indexes_by_sig).
--define(BY_PID, couchdb_indexes_by_pid).
--define(BY_DB, couchdb_indexes_by_db).
 -define(RELISTEN_DELAY, 5000).
+-define(MAX_INDEXES_OPEN, 500).
 
--record(st, {root_dir}).
+-record(st, {
+    root_dir,
+    max_indexes,
+    open,
+    sys_open
+}).
 
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
@@ -94,21 +99,27 @@ get_index(Module, Db, DDoc, Fun) when is_binary(DDoc) ->
 get_index(Module, Db, DDoc, Fun) when is_function(Fun, 1) ->
     {ok, InitState} = Module:init(Db, DDoc),
     {ok, FunResp} = Fun(InitState),
-    {ok, Pid} = get_index(Module, InitState),
-    {ok, Pid, FunResp};
+    case get_index_from_state(Module, InitState, couch_db:is_system_db(Db)) of
+        {ok, Pid} ->
+            {ok, Pid, FunResp};
+        {error, all_active} ->
+            {error, all_active}
+    end;
 get_index(Module, Db, DDoc, _Fun) ->
     {ok, InitState} = Module:init(Db, DDoc),
-    get_index(Module, InitState).
+    get_index_from_state(Module, InitState, couch_db:is_system_db(Db)).
 
 
-get_index(Module, IdxState) ->
+get_index_from_state(Module, IdxState, SysOwned) ->
     DbName = Module:get(db_name, IdxState),
     Sig = Module:get(signature, IdxState),
-    case ets:lookup(?BY_SIG, {DbName, Sig}) of
-        [{_, Pid}] when is_pid(Pid) ->
+    Args = {Module, IdxState, DbName, Sig, SysOwned},
+    case incref({DbName, Sig}) of
+        ok ->
+            [{_, {Pid, Monitor, _SysOwned}}] = ets:lookup(?BY_SIG, {DbName, Sig}),
+            ok = couch_index_monitor:notify(Monitor),
             {ok, Pid};
         _ ->
-            Args = {Module, IdxState, DbName, Sig},
             gen_server:call(?MODULE, {get_index, Args}, infinity)
     end.
 
@@ -116,13 +127,17 @@ get_index(Module, IdxState) ->
 init([]) ->
     process_flag(trap_exit, true),
     ok = config:listen_for_changes(?MODULE, couch_index_util:root_dir()),
-    ets:new(?BY_SIG, [protected, set, named_table]),
-    ets:new(?BY_PID, [private, set, named_table]),
-    ets:new(?BY_DB, [protected, bag, named_table]),
+    ets:new(?BY_DB, [public, bag, named_table]),
+    ets:new(?BY_SIG, [public, set, named_table]),
+    ets:new(?BY_PID, [public, set, named_table]),
+    ets:new(?BY_COUNTERS, [public, set, named_table]),
+    ets:new(?BY_IDLE, [public, set, named_table]),
     couch_event:link_listener(?MODULE, handle_db_event, nil, [all_dbs]),
     RootDir = couch_index_util:root_dir(),
     couch_file:init_delete_dir(RootDir),
-    {ok, #st{root_dir=RootDir}}.
+    MaxIndexes = list_to_integer(
+        config:get("couchdb", "max_indexes_open", integer_to_list(?MAX_INDEXES_OPEN))),
+    {ok, #st{root_dir=RootDir, max_indexes=MaxIndexes, open=0, sys_open=0}}.
 
 
 terminate(_Reason, _State) ->
@@ -130,51 +145,122 @@ terminate(_Reason, _State) ->
     lists:map(fun couch_util:shutdown_sync/1, Pids),
     ok.
 
+make_room(State, false) ->
+    case maybe_close_idle(State) of
+        {ok, NewState} ->
+            {ok, NewState};
+        Other ->
+            Other
+    end;
+make_room(State, true) ->
+    {ok, State}.
 
-handle_call({get_index, {_Mod, _IdxState, DbName, Sig}=Args}, From, State) ->
+-spec maybe_close_idle(#st{}) -> {ok, #st{}} | {error, all_active}.
+maybe_close_idle(#st{open=Open, max_indexes=Max}=State) when Open < Max ->
+    {ok, State};
+
+maybe_close_idle(State) ->
+    try
+        {ok, close_idle(State)}
+    catch error:all_active ->
+        {error, all_active}
+    end.
+
+-spec close_idle(#st{}) -> #st{}.
+close_idle(State) ->
+    ets:safe_fixtable(?BY_IDLE, true),
+    try
+        close_idle(State, ets:first(?BY_IDLE))
+    after
+        ets:safe_fixtable(?BY_IDLE, false)
+    end.
+
+
+-spec close_idle(#st{}, term()) -> #st{}.
+close_idle(_State, '$end_of_table') ->
+    erlang:error(all_active);
+
+close_idle(State, Name) ->
+    case ets:lookup(?BY_SIG, Name) of
+        [{_, {Pid, _Monitor, SysOwned}}] ->
+            true = ets:delete(?BY_IDLE, Name),
+            couch_index:stop(Pid),
+            closed(State, SysOwned);
+        [] ->
+            true = ets:delete(?BY_IDLE, Name),
+            close_idle(State, ets:next(?BY_IDLE, Name))
+    end.
+
+
+handle_call({get_index, {_Mod, _IdxState, DbName, Sig, SysOwned}=Args}, From, State) ->
     case ets:lookup(?BY_SIG, {DbName, Sig}) of
         [] ->
-            spawn_link(fun() -> new_index(Args) end),
-            ets:insert(?BY_SIG, {{DbName, Sig}, [From]}),
+            case make_room(State, SysOwned) of
+                {ok, NewState} ->
+                    spawn_link(fun() -> new_index(Args) end),
+                    Monitor = couch_index_monitor:spawn_link({DbName, Sig}, SysOwned),
+                    ets:insert(?BY_SIG, {{DbName, Sig}, {[From], Monitor, SysOwned}}),
+                    {noreply, NewState};
+                {error, all_active} ->
+                    {reply, {error, all_active}, State}
+            end;
+        [{_, {Waiters, Monitor, SysOwned}}] when is_list(Waiters) ->
+            ets:insert(?BY_SIG, {{DbName, Sig}, {[From | Waiters], Monitor, SysOwned}}),
             {noreply, State};
-        [{_, Waiters}] when is_list(Waiters) ->
-            ets:insert(?BY_SIG, {{DbName, Sig}, [From | Waiters]}),
-            {noreply, State};
-        [{_, Pid}] when is_pid(Pid) ->
+        [{_, {Pid, Monitor, _SysOwned}}] when is_pid(Pid) ->
+            ok = incref({DbName, Sig}),
+            ok = couch_index_monitor:notify(Monitor, From),
             {reply, {ok, Pid}, State}
     end;
 handle_call({async_open, {DbName, DDocId, Sig}, {ok, Pid}}, _From, State) ->
-    [{_, Waiters}] = ets:lookup(?BY_SIG, {DbName, Sig}),
-    [gen_server:reply(From, {ok, Pid}) || From <- Waiters],
+    [{_, {Waiters, Monitor, SysOwned}}] = ets:lookup(?BY_SIG, {DbName, Sig}),
     link(Pid),
-    add_to_ets(DbName, Sig, DDocId, Pid),
-    {reply, ok, State};
-handle_call({async_error, {DbName, _DDocId, Sig}, Error}, _From, State) ->
-    [{_, Waiters}] = ets:lookup(?BY_SIG, {DbName, Sig}),
+    ets:insert(?BY_SIG, {{DbName, Sig}, {Pid, Monitor, SysOwned}}),
+    ets:insert(?BY_PID, {Pid, {DbName, Sig}}),
+    ets:insert(?BY_COUNTERS, {{DbName, Sig}, 0}),
+    ets:insert(?BY_DB, {DbName, {DDocId, Sig}}),
+    lists:foreach(fun(From) ->
+        {Client, _} = From,
+        ok = incref({DbName, Sig}),
+        ok = couch_index_monitor:notify(Monitor, Client),
+        gen_server:reply(From, {ok, Pid})
+    end, Waiters),
+    {reply, ok, opened(State, SysOwned)};
+handle_call({async_error, {DbName, _DDocId, Sig}, Error}, {FromPid, _}, State) ->
+    [{_, {Waiters, Monitor, _SO}}] = ets:lookup(?BY_SIG, {DbName, Sig}),
     [gen_server:reply(From, Error) || From <- Waiters],
-    ets:delete(?BY_SIG, {DbName, Sig}),
+    true = ets:delete(?BY_COUNTERS, {DbName, Sig}),
+    true = ets:delete(?BY_SIG, {DbName, Sig}),
+    true = ets:delete(?BY_PID, FromPid),
+    true = ets:delete(?BY_IDLE, {DbName, Sig}),
+    ok = couch_index_monitor:close(Monitor),
     {reply, ok, State};
+handle_call({set_max_indexes_open, Max}, _From, State) ->
+    {reply, ok, State#st{max_indexes=Max}};
 handle_call({reset_indexes, DbName}, _From, State) ->
-    reset_indexes(DbName, State#st.root_dir),
-    {reply, ok, State}.
+    {reply, ok, reset_indexes(DbName, State)};
+handle_call(open_index_count, _From, State) ->
+    {reply, {State#st.open, State#st.sys_open}, State};
+handle_call(get_server, _From, State) ->
+    {reply, State, State}.
 
 
 handle_cast({reset_indexes, DbName}, State) ->
-    reset_indexes(DbName, State#st.root_dir),
-    {noreply, State}.
+    {noreply, reset_indexes(DbName, State)}.
 
 handle_info({'EXIT', Pid, Reason}, Server) ->
     case ets:lookup(?BY_PID, Pid) of
-        [{Pid, {DbName, Sig}}] ->
+        [{_, {DbName, Sig}}] ->
+            [{_, {_W, _M, SysOwned}}] = ets:lookup(?BY_SIG, {DbName, Sig}),
             [{DbName, {DDocId, Sig}}] =
                 ets:match_object(?BY_DB, {DbName, {'$1', Sig}}),
-            rem_from_ets(DbName, Sig, DDocId, Pid);
+            rem_from_ets(DbName, Sig, DDocId, Pid),
+            {noreply, closed(Server, SysOwned)};
         [] when Reason /= normal ->
             exit(Reason);
         _Else ->
-            ok
-    end,
-    {noreply, Server};
+            {noreply, Server}
+    end;
 handle_info(restart_config_listener, State) ->
     ok = config:listen_for_changes(?MODULE, couch_index_util:root_dir()),
     {noreply, State};
@@ -197,8 +283,10 @@ handle_config_change("couchdb", "index_dir", _, _, _) ->
 handle_config_change("couchdb", "view_index_dir", _, _, _) ->
     exit(whereis(couch_index_server), config_change),
     remove_handler;
-handle_config_change(_, _, _, _, RootDir) ->
-    {ok, RootDir}.
+handle_config_change("couchdb", "max_indexes_open", Max, _, _) when is_list(Max) ->
+    {ok, gen_server:call(?MODULE, {set_max_indexes_open, list_to_integer(Max)})};
+handle_config_change(_, _, _, _, _) ->
+    {ok, nil}.
 
 handle_config_terminate(_, stop, _) ->
     ok;
@@ -206,7 +294,8 @@ handle_config_terminate(_Server, _Reason, _State) ->
     erlang:send_after(?RELISTEN_DELAY, whereis(?MODULE), restart_config_listener),
     {ok, couch_index_util:root_dir()}.
 
-new_index({Mod, IdxState, DbName, Sig}) ->
+
+new_index({Mod, IdxState, DbName, Sig, _SysOwned}) ->
     DDocId = Mod:get(idx_name, IdxState),
     case couch_index:start_link({Mod, IdxState}) of
         {ok, Pid} ->
@@ -219,29 +308,29 @@ new_index({Mod, IdxState, DbName, Sig}) ->
     end.
 
 
-reset_indexes(DbName, Root) ->
+reset_indexes(DbName, State) ->
+    #st{root_dir=Root} = State,
     % shutdown all the updaters and clear the files, the db got changed
-    Fun = fun({_, {DDocId, Sig}}) ->
-        [{_, Pid}] = ets:lookup(?BY_SIG, {DbName, Sig}),
+    Fun = fun({_, {DDocId, Sig}}, StateAcc) ->
+        [{_, {Pid, Monitor, SysOwned}}] = ets:lookup(?BY_SIG, {DbName, Sig}),
+        couch_index_monitor:close(Monitor),
         MRef = erlang:monitor(process, Pid),
         gen_server:cast(Pid, delete),
         receive {'DOWN', MRef, _, _, _} -> ok end,
-        rem_from_ets(DbName, Sig, DDocId, Pid)
+        rem_from_ets(DbName, Sig, DDocId, Pid),
+        closed(StateAcc, SysOwned)
     end,
-    lists:foreach(Fun, ets:lookup(?BY_DB, DbName)),
+    NewState = lists:foldl(Fun, State, ets:lookup(?BY_DB, DbName)),
     Path = couch_index_util:index_dir("", DbName),
-    couch_file:nuke_dir(Root, Path).
-
-
-add_to_ets(DbName, Sig, DDocId, Pid) ->
-    ets:insert(?BY_SIG, {{DbName, Sig}, Pid}),
-    ets:insert(?BY_PID, {Pid, {DbName, Sig}}),
-    ets:insert(?BY_DB, {DbName, {DDocId, Sig}}).
+    couch_file:nuke_dir(Root, Path),
+    NewState.
 
 
 rem_from_ets(DbName, Sig, DDocId, Pid) ->
-    ets:delete(?BY_SIG, {DbName, Sig}),
-    ets:delete(?BY_PID, Pid),
+    true = ets:delete(?BY_COUNTERS, {DbName, Sig}),
+    true = ets:delete(?BY_SIG, {DbName, Sig}),
+    true = ets:delete(?BY_PID, Pid),
+    true = ets:delete(?BY_IDLE, {DbName, Sig}),
     ets:delete_object(?BY_DB, {DbName, {DDocId, Sig}}).
 
 
@@ -254,7 +343,7 @@ handle_db_event(DbName, deleted, St) ->
 handle_db_event(DbName, {ddoc_updated, DDocId}, St) ->
     lists:foreach(fun({_DbName, {_DDocId, Sig}}) ->
         case ets:lookup(?BY_SIG, {DbName, Sig}) of
-            [{_, IndexPid}] ->
+            [{_, {IndexPid, _Monitor, _SysOwned}}] ->
                 (catch gen_server:cast(IndexPid, ddoc_updated));
             [] ->
                 ok
@@ -263,3 +352,33 @@ handle_db_event(DbName, {ddoc_updated, DDocId}, St) ->
     {ok, St};
 handle_db_event(_DbName, _Event, St) ->
     {ok, St}.
+
+
+-spec opened(#st{}, boolean()) -> #st{}.
+opened(State, IsSysOwned) ->
+    case IsSysOwned of
+        true -> State#st{sys_open=State#st.sys_open + 1};
+        false -> State#st{open=State#st.open + 1}
+    end.
+
+
+-spec closed(#st{}, boolean()) -> #st{}.
+closed(State, IsSysOwned) ->
+    case IsSysOwned of
+        true -> State#st{sys_open=State#st.sys_open - 1};
+        false -> State#st{open=State#st.open - 1}
+    end.
+
+
+incref(Name) ->
+    case (catch ets:update_counter(?BY_COUNTERS, Name, 1)) of
+        1 ->
+            ets:delete(?BY_IDLE, Name),
+            ok;
+        N when is_integer(N), N > 0 ->
+            ok;
+        N when is_integer(N) ->
+            {invalid_refcount, N};
+        {'EXIT', {badarg, _}} ->
+            missing_counter
+	end.
