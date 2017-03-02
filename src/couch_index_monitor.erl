@@ -14,7 +14,7 @@
 
 
 -export([
-    spawn_link/2,
+    spawn_link/1,
     close/1,
     set_pid/2,
 
@@ -24,7 +24,7 @@
 ]).
 
 -export([
-    init/2
+    init/1
 ]).
 
 
@@ -34,15 +34,14 @@
 -record(st, {
     name,
     type,
-    is_sys,
     ref,
     client_refs,
     closing
 }).
 
 
-spawn_link(Name, IsSys) ->
-    erlang:spawn_link(?MODULE, init, [Name, IsSys]).
+spawn_link(Name) ->
+    erlang:spawn_link(?MODULE, init, [Name]).
 
 
 close(Monitor) ->
@@ -67,11 +66,11 @@ notify(Monitor, {Client, _}) when is_pid(Client) ->
     notify(Monitor, Client).
 
 
-cancel(Name, {Client, Monitor, IsSys})
+cancel(Name, {Client, Monitor})
         when Client == self(), is_pid(Monitor) ->
     Monitor ! {cancel, self()},
     case (catch ets:update_counter(?BY_COUNTERS, Name, -1)) of
-        0 when not IsSys ->
+        0 ->
             true = ets:insert(?BY_IDLE, {Name}),
             ok;
         _ ->
@@ -79,11 +78,10 @@ cancel(Name, {Client, Monitor, IsSys})
     end.
 
 
-init(Name, IsSys) ->
+init(Name) ->
     {ok, CRefs} = khash:new(),
     loop(#st{
         name = Name,
-        is_sys = IsSys,
         ref = undefined,
         client_refs = CRefs,
         closing = false
@@ -153,10 +151,6 @@ handle_info(Msg, St) ->
 
 maybe_set_idle(St) ->
     case khash:size(St#st.client_refs) of
-        0 when St#st.is_sys ->
-            % System dbs don't go idle so they're
-            % never a candidate to get closed
-            ok;
         0 ->
             % We're now idle
             ets:insert(?BY_IDLE, {St#st.name});
