@@ -16,24 +16,25 @@
 -include_lib("couch/include/couch_eunit.hrl").
 -include_lib("couch/include/couch_db.hrl").
 
--define(DDOC, {[{
-    <<"views">>, {[
-        {<<"test_view">>, {[{<<"map">>, <<"function(doc) {emit(null, 1);}">>}]}
-    }]}
-}]}).
+ddoc_gen(I) ->
+    IBin = integer_to_binary(I),
+    #doc{
+        id = <<"_design/mydb_", IBin/binary>>,
+        body = {[
+            {<<"views">>, {[
+                {<<"test_view_", IBin/binary>>, {[
+                    {<<"map">>, <<"function(doc) {emit(null, 1);}">>}]}
+                }
+            ]}}
+        ]}
+    }.
 
 
 setup() ->
-    DbName = ?tempdb(),
-    {ok, Db} = couch_db:create(DbName, [?ADMIN_CTX]),
-    DDocName = <<"_design/", DbName/binary>>,
-    DDoc = #doc{id = DDocName, body = ?DDOC},
-    {ok, _} = couch_db:update_doc(Db, DDoc, [?ADMIN_CTX]),
-    {Db, DDoc}.
+    ok.
 
 
-teardown({Db, _DDoc}) ->
-    couch_db:close(Db),
+teardown(_) ->
     ok.
 
 
@@ -47,18 +48,21 @@ monitoring_test_() ->
                 foreach,
                 fun setup/0, fun teardown/1,
                 [
-                    fun test_basic/1
+                    fun test_basic/1,
+                    fun test_soft_max/1
                 ]
             }
         }
     }.
 
-
-test_basic({Db, DDoc}) ->
+test_basic(_) ->
     ?_test(begin
-        {ok, Pid} = couch_index_server:get_index(couch_mrview_index, Db#db.name, DDoc#doc.id),
+        DbName = ?tempdb(),
+        {ok, Db} = couch_db:create(DbName, [?ADMIN_CTX]),
+        DDoc = ddoc_gen(1),
+        {ok, _} = couch_db:update_doc(Db, DDoc, [?ADMIN_CTX]),
+        {ok, Pid} = couch_index_server:get_index(couch_mrview_index, DbName, DDoc#doc.id),
         {ok, IdxState} = couch_mrview_index:init(Db, DDoc),
-        DbName = couch_mrview_index:get(db_name, IdxState),
         Sig = couch_mrview_index:get(signature, IdxState),
         [{_, {Pid, Monitor}}] = ets:lookup(?BY_SIG, {DbName, Sig}),
         ?assert(is_pid(Pid)),
@@ -75,6 +79,41 @@ test_basic({Db, DDoc}) ->
         couch_index_monitor:cancel({DbName, Sig}, {self(), Monitor}),
         ?assertEqual(0, get_count({DbName, Sig})),
         ?assertEqual(1, length(ets:lookup(?BY_IDLE, {DbName, Sig}))),
+        couch_db:close(Db),
+        couch_server:delete(DbName, [?ADMIN_CTX]),
+        ok
+    end).
+
+
+test_soft_max(_) ->
+    ?_test(begin
+        DbName = ?tempdb(),
+        {ok, Db} = couch_db:create(DbName, [?ADMIN_CTX]),
+        lists:foreach(fun(I) ->
+            {ok, _} = couch_db:update_doc(Db, ddoc_gen(I), [?ADMIN_CTX])
+        end, lists:seq(1, 10)),
+        config:set("couchdb", "soft_max_indexes_open", "5"),
+        ?assertEqual(0, length(ets:tab2list(?BY_SIG))),
+        ?assertEqual(0, gen_server:call(couch_index_server, open_index_count)),
+        Acqs = lists:map(fun(I) ->
+            DDoc = ddoc_gen(I),
+            Acq = spawn_monitor_acquirer(DbName, DDoc#doc.id),
+            ?assertEqual(I, length(ets:tab2list(?BY_SIG))),
+            ?assertEqual(I, gen_server:call(couch_index_server, open_index_count)),
+            Acq
+        end, lists:seq(1, 10)),
+        {First5, Last5} = lists:split(5, Acqs),
+        lists:foldl(fun(Acq, Acc) ->
+            wait_down(Acq),
+            couch_index_server ! close_idle,
+            sys:get_status(couch_index_server), % wait until close_idle processed
+            ?assertEqual(10-Acc, gen_server:call(couch_index_server, open_index_count)),
+            Acc+1
+        end, 1, Last5),
+        lists:foreach(fun(Acq) ->
+            wait_down(Acq),
+            ?assertEqual(5, gen_server:call(couch_index_server, open_index_count))
+        end, First5),
         ok
     end).
 
@@ -82,6 +121,8 @@ test_basic({Db, DDoc}) ->
 wait_down({Pid, Ref}) ->
     Pid ! close,
     receive {'DOWN', Ref, process, Pid, normal} ->
+        % this is a hack to wait for couch_index_server to process DOWN message
+        sys:get_status(couch_index_server),
         ok
     end.
 
