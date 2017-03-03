@@ -34,11 +34,13 @@
 
 -define(RELISTEN_DELAY, 5000).
 -define(MAX_INDEXES_OPEN, 500).
+-define(CLOSE_INTERVAL, 5000).
 
 -record(st, {
     root_dir,
     soft_max_indexes,
-    open
+    open,
+    timer
 }).
 
 start_link() ->
@@ -130,9 +132,10 @@ init([]) ->
     couch_event:link_listener(?MODULE, handle_db_event, nil, [all_dbs]),
     RootDir = couch_index_util:root_dir(),
     couch_file:init_delete_dir(RootDir),
+    {ok, Timer} = timer:send_interval(?CLOSE_INTERVAL, close_idle),
     MaxIndexes = list_to_integer(
         config:get("couchdb", "soft_max_indexes_open", integer_to_list(?MAX_INDEXES_OPEN))),
-    {ok, #st{root_dir=RootDir, soft_max_indexes=MaxIndexes, open=0}}.
+    {ok, #st{root_dir=RootDir, soft_max_indexes=MaxIndexes, open=0, timer=Timer}}.
 
 
 terminate(_Reason, _State) ->
@@ -158,19 +161,22 @@ maybe_close_idle(State) ->
 close_idle(State, '$end_of_table') ->
     State;
 
-close_idle(State, Name) ->
-    true = ets:delete(?BY_IDLE, Name),
-    case ets:lookup(?BY_SIG, Name) of
+close_idle(State, {DbName, Sig}) ->
+    true = ets:delete(?BY_IDLE, {DbName, Sig}),
+    case ets:lookup(?BY_SIG, {DbName, Sig}) of
         [{_, {Pid, _Monitor}}] ->
             couch_index:stop(Pid),
+            [{DbName, {DDocId, Sig}}] =
+                ets:match_object(?BY_DB, {DbName, {'$1', Sig}}),
+            rem_from_ets(DbName, Sig, DDocId, Pid),
             case closed(State) of
                 NewState when NewState#st.open > State#st.soft_max_indexes ->
-                    close_idle(NewState, ets:next(?BY_IDLE, Name));
+                    close_idle(NewState, ets:next(?BY_IDLE, {DbName, Sig}));
                 NewState ->
                     NewState
             end;
         [] ->
-            close_idle(State, ets:next(?BY_IDLE, Name))
+            close_idle(State, ets:next(?BY_IDLE, {DbName, Sig}))
     end.
 
 
@@ -238,6 +244,11 @@ handle_info({'EXIT', Pid, Reason}, Server) ->
         _Else ->
             {noreply, Server}
     end;
+handle_info(close_idle, State) ->
+    {ok, NewState} = maybe_close_idle(State),
+    {ok, cancel} = timer:cancel(State#st.timer),
+    {ok, Timer} = timer:send_interval(?CLOSE_INTERVAL, close_idle),
+    {noreply, NewState#st{timer=Timer}};
 handle_info(restart_config_listener, State) ->
     ok = config:listen_for_changes(?MODULE, couch_index_util:root_dir()),
     {noreply, State};
