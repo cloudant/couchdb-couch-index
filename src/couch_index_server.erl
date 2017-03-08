@@ -39,8 +39,7 @@
 -record(st, {
     root_dir,
     soft_max_indexes,
-    open,
-    timer
+    open
 }).
 
 start_link() ->
@@ -132,10 +131,10 @@ init([]) ->
     couch_event:link_listener(?MODULE, handle_db_event, nil, [all_dbs]),
     RootDir = couch_index_util:root_dir(),
     couch_file:init_delete_dir(RootDir),
-    {ok, Timer} = timer:send_interval(?CLOSE_INTERVAL, close_idle),
+    erlang:send_after(?CLOSE_INTERVAL, self(), close_idle),
     MaxIndexes = list_to_integer(
         config:get("couchdb", "soft_max_indexes_open", integer_to_list(?MAX_INDEXES_OPEN))),
-    {ok, #st{root_dir=RootDir, soft_max_indexes=MaxIndexes, open=0, timer=Timer}}.
+    {ok, #st{root_dir=RootDir, soft_max_indexes=MaxIndexes, open=0}}.
 
 
 terminate(_Reason, _State) ->
@@ -244,11 +243,10 @@ handle_info({'EXIT', Pid, Reason}, Server) ->
         _Else ->
             {noreply, Server}
     end;
-handle_info(close_idle, State) ->
+handle_info({timeout, _Timer, close_idle}, State) ->
     {ok, NewState} = maybe_close_idle(State),
-    {ok, cancel} = timer:cancel(State#st.timer),
-    {ok, Timer} = timer:send_interval(?CLOSE_INTERVAL, close_idle),
-    {noreply, NewState#st{timer=Timer}};
+    erlang:send_after(?CLOSE_INTERVAL, self(), close_idle),
+    {noreply, NewState};
 handle_info(restart_config_listener, State) ->
     ok = config:listen_for_changes(?MODULE, couch_index_util:root_dir()),
     {noreply, State};
