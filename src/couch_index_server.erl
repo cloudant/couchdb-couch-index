@@ -185,7 +185,7 @@ handle_call({get_index, {_Mod, _IdxState, DbName, Sig}=Args}, From, State) ->
         [] ->
             {ok, NewState} = maybe_close_idle(State),
             spawn_link(fun() -> new_index(Args) end),
-            Monitor = couch_index_monitor:spawn_link({DbName, Sig}),
+            {ok, Monitor} = couch_index_monitor:start_link({DbName, Sig}),
             ets:insert(?BY_SIG, {{DbName, Sig}, {[From], Monitor}}),
             {noreply, NewState};
         [{_, {Waiters, Monitor}}] when is_list(Waiters) ->

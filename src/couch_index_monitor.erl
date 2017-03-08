@@ -12,9 +12,11 @@
 
 -module(couch_index_monitor).
 
+-behaviour(gen_server).
+
 
 -export([
-    spawn_link/1,
+    start_link/1,
     close/1,
     set_pid/2,
 
@@ -24,7 +26,12 @@
 ]).
 
 -export([
-    init/1
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    code_change/3,
+    terminate/2
 ]).
 
 
@@ -40,18 +47,16 @@
 }).
 
 
-spawn_link(Name) ->
-    erlang:spawn_link(?MODULE, init, [Name]).
+start_link(Name) ->
+    gen_server:start_link(?MODULE, [Name], []).
 
 
 close(Monitor) ->
-    Monitor ! exit,
-    ok.
+    gen_server:cast(Monitor, exit).
 
 
 set_pid(Monitor, Pid) ->
-    Monitor ! {set_pid, Pid},
-    ok.
+    gen_server:cast(Monitor, {set_pid, Pid}).
 
 
 notify(Monitor) ->
@@ -59,8 +64,7 @@ notify(Monitor) ->
 
 
 notify(Monitor, Client) when is_pid(Client) ->
-    Monitor ! {notify, Client},
-    ok;
+    gen_server:cast(Monitor, {notify, Client});
 
 notify(Monitor, {Client, _}) when is_pid(Client) ->
     notify(Monitor, Client).
@@ -68,7 +72,7 @@ notify(Monitor, {Client, _}) when is_pid(Client) ->
 
 cancel(Name, {Client, Monitor})
         when Client == self(), is_pid(Monitor) ->
-    Monitor ! {cancel, self()},
+    gen_server:cast(Monitor, {cancel, self()}),
     case (catch ets:update_counter(?BY_COUNTERS, Name, -1)) of
         0 ->
             true = ets:insert(?BY_IDLE, {Name}),
@@ -78,28 +82,32 @@ cancel(Name, {Client, Monitor})
     end.
 
 
-init(Name) ->
+init([Name]) ->
     {ok, CRefs} = khash:new(),
-    loop(#st{
+    {ok, #st{
         name = Name,
         ref = undefined,
         client_refs = CRefs,
         closing = false
-    }).
+    }}.
 
 
-handle_info(exit, St) ->
-    {stop, normal, St};
+handle_call(Msg, From, St) ->
+    {stop, {unknown_call, Msg, From}, St}.
 
-handle_info({set_pid, Pid}, #st{ref = undefined} = St) ->
+
+handle_cast(exit, St) ->
+    {stop, shutdown, St};
+
+handle_cast({set_pid, Pid}, #st{ref = undefined} = St) ->
     Ref = erlang:monitor(process, Pid),
     {noreply, St#st{ref = Ref}};
 
-handle_info({set_pid, Pid}, #st{ref = Ref} = St) when is_reference(Ref) ->
+handle_cast({set_pid, Pid}, #st{ref = Ref} = St) when is_reference(Ref) ->
     erlang:demonitor(Ref, [flush]),
-    handle_info({set_pid, Pid}, St#st{ref = undefined});
+    handle_cast({set_pid, Pid}, St#st{ref = undefined});
 
-handle_info({notify, Client}, St) when is_pid(Client) ->
+handle_cast({notify, Client}, St) when is_pid(Client) ->
     case khash:get(St#st.client_refs, Client) of
         {Ref, Count} when is_reference(Ref), is_integer(Count), Count > 0 ->
             khash:put(St#st.client_refs, Client, {Ref, Count + 1});
@@ -118,7 +126,7 @@ handle_info({notify, Client}, St) when is_pid(Client) ->
     end,
     {noreply, St};
 
-handle_info({cancel, Client}, St) when is_pid(Client) ->
+handle_cast({cancel, Client}, St) when is_pid(Client) ->
     case khash:get(St#st.client_refs, Client) of
         {Ref, 1} when is_reference(Ref) ->
             erlang:demonitor(Ref, [flush]),
@@ -129,8 +137,12 @@ handle_info({cancel, Client}, St) when is_pid(Client) ->
     end,
     {noreply, St};
 
+handle_cast(Msg, St) ->
+    {stop, {unknown_cast, Msg}, St}.
+
+
 handle_info({'DOWN', Ref, process, _, _}, #st{ref = Ref} = St) ->
-    {stop, normal, St};
+    {stop, shutdown, St};
 
 handle_info({'DOWN', _Ref, process, Pid, _Reason}, St) ->
     #st{name=Name} = St,
@@ -149,6 +161,14 @@ handle_info(Msg, St) ->
     {stop, {bad_info, Msg}, St}.
 
 
+code_change(_OldVsn, St, _Extra) ->
+    {ok, St}.
+
+
+terminate(_Reason, _St) ->
+    ok.
+
+
 maybe_set_idle(St) ->
     case khash:size(St#st.client_refs) of
         0 ->
@@ -157,22 +177,4 @@ maybe_set_idle(St) ->
         N when is_integer(N), N > 0 ->
             % We have other clients
             ok
-    end.
-
-
-loop(St) ->
-    receive
-        Other ->
-            do_handle_info(Other, St)
-    end.
-
-
-do_handle_info(Msg, St) ->
-    try handle_info(Msg, St) of
-        {noreply, NewSt} ->
-            loop(NewSt);
-        {stop, Reason, _NewSt} ->
-            exit(Reason)
-    catch T:R ->
-        exit({T, R})
     end.
